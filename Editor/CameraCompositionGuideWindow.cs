@@ -23,54 +23,61 @@ namespace Qsyi.CameraGuide.Editor
         public string timestampUtc;
     }
 
-    /// <summary>Editor-only: periodically exports the target Camera's real
-    /// FOV/pitch/roll to a JSON file AvaSnap watches, so AvaSnap's own
-    /// 位置合わせモード guide overlay (drawn over the live VRChat window,
-    /// see AvaSnap's ControlPanelWindow) can auto-follow whatever camera
-    /// angle is currently being tested in Unity instead of requiring manual
-    /// FOV input/horizon dragging. Works in both Edit mode and Play mode
-    /// (EditorApplication.update runs in both). Lives entirely under an
+    /// <summary>Editor-only: exports the target Camera's real FOV/pitch/
+    /// roll to a JSON file AvaSnap reads, so AvaSnap's own 位置合わせモード
+    /// guide overlay (drawn over the live VRChat window, see AvaSnap's
+    /// ControlPanelWindow) can match whatever camera angle is currently
+    /// being tested in Unity instead of requiring manual FOV input/horizon
+    /// dragging.
+    ///
+    /// REQUEST-DRIVEN, not continuous: earlier revisions polled the target
+    /// Camera on a timer (EditorApplication.update) the whole time this was
+    /// enabled, which meant Unity was doing SOME work (a per-tick check, or
+    /// worse, a disk write) even while nobody was looking at the guide at
+    /// all. This version does none of that -- it sits on a FileSystemWatcher
+    /// waiting for AvaSnap's own "取得" button to touch RequestPath, and
+    /// only then reads the camera and writes ExportPath, once. Genuinely
+    /// zero background cost between requests (a FileSystemWatcher is an OS-
+    /// level notification, not a poll), at the cost of losing the old
+    /// "guide live-follows the camera as you drag it in Unity" behavior --
+    /// AvaSnap now shows a snapshot from the last time its own button was
+    /// pressed, not a continuous feed. Deliberate tradeoff, chosen over the
+    /// old polling version for exactly that reason.
+    ///
+    /// Works in both Edit mode and Play mode. Lives entirely under an
     /// "Editor" folder, so it never ships with the uploaded world, and only
-    /// ever writes to a file in AvaSnap's own AppData folder -- no network,
-    /// no scene hierarchy changes.</summary>
+    /// ever touches files in AvaSnap's own AppData folder -- no network, no
+    /// scene hierarchy changes.</summary>
     [InitializeOnLoad]
     public class CameraCompositionGuideWindow : EditorWindow
     {
         private const string EnabledPrefKey = "Qsyi.CameraCompositionGuide.Enabled";
 
-        // 5-10Hz is plenty smooth for a composition guide and keeps the
-        // per-tick check trivial -- no need to match render framerate for
-        // numbers that only change as fast as someone can move a mouse/
-        // keyboard-driven camera. This is just how often we RE-CHECK
-        // whether anything changed, not how often we actually write to
-        // disk -- see ExportCamera's own dirty-check.
-        private const double ExportIntervalSeconds = 0.15;
-
-        // While the camera is holding still (the common case while tweaking
-        // everything ELSE about a shot), there's nothing new to write --
-        // ExportCamera skips the actual File.WriteAllText when fov/pitch/
-        // roll haven't moved, so idle time costs no disk I/O at all instead
-        // of writing the same numbers ~6.7 times a second forever. No
-        // separate "heartbeat" write to fake liveness while unchanged: the
-        // resulting staleness (see AvaSnap's own UnityCameraGuideService.
-        // StaleAfter, 2s) only flips a small "Unity: 一時停止中" status
-        // badge, never the guide's own visibility -- so there's nothing to
-        // protect against by writing data that hasn't actually changed.
-        private const double ExportChangeThreshold = 0.01;
+        private static readonly string AppDataDir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "AvaSnap");
+        private static readonly string ExportPath = Path.Combine(AppDataDir, "unity_camera_guide.json");
+        private const string RequestFileName = "unity_camera_guide_request.txt";
+        private static readonly string RequestPath = Path.Combine(AppDataDir, RequestFileName);
 
         private static bool s_enabled;
         private static Camera s_targetCameraOverride;
-        private static double s_lastExportTime;
-        private static bool s_hasLastWritten;
-        private static double s_lastWrittenFov, s_lastWrittenPitch, s_lastWrittenRoll;
-        private static readonly string ExportPath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "AvaSnap", "unity_camera_guide.json");
+        private static FileSystemWatcher s_requestWatcher;
+
+        // FileSystemWatcher's Changed event can fire more than once for a
+        // single logical write (a known Windows quirk), and its callback
+        // runs on a ThreadPool thread, not the main thread -- this flag
+        // (read/written from both) just collapses however many of those
+        // land into a single EditorApplication.delayCall queued for the
+        // next main-thread tick, instead of queuing one per event.
+        private static volatile bool s_exportQueued;
+
+        private static string s_lastRequestStatus = "リクエスト待機中(AvaSnapの「取得」ボタンを押すと反応します)";
 
         /// <summary>EditorPrefs (not SessionState): persists across Editor
-        /// restarts, defaults to true, global per-machine -- see the
-        /// original Game-view-drawing version's own comment on this same
-        /// choice (still applies, just now gating the file export instead
-        /// of GL drawing).</summary>
+        /// restarts, defaults to true, global per-machine. Now also gates
+        /// whether the FileSystemWatcher exists at all -- turning this off
+        /// means Unity doesn't even listen for requests, not just "listens
+        /// but ignores them".</summary>
         private static bool Enabled
         {
             get => s_enabled;
@@ -79,58 +86,94 @@ namespace Qsyi.CameraGuide.Editor
                 if (s_enabled == value) return;
                 s_enabled = value;
                 EditorPrefs.SetBool(EnabledPrefKey, value);
+                UpdateWatcher();
             }
         }
 
         static CameraCompositionGuideWindow()
         {
             s_enabled = EditorPrefs.GetBool(EnabledPrefKey, true);
-            EditorApplication.update += OnEditorUpdate;
+            UpdateWatcher();
         }
 
         [MenuItem("Tools/qsyi/カメラ構図補助線 (AvaSnap連携)")]
         private static void Open() => GetWindow<CameraCompositionGuideWindow>("構図補助線");
 
+        /// <summary>(Re)creates the watcher to match the current Enabled
+        /// state -- called from the Enabled setter and the static
+        /// constructor, the only two places that state can change.</summary>
+        private static void UpdateWatcher()
+        {
+            s_requestWatcher?.Dispose();
+            s_requestWatcher = null;
+            if (!s_enabled) return;
+
+            Directory.CreateDirectory(AppDataDir);
+            var watcher = new FileSystemWatcher(AppDataDir, RequestFileName)
+            {
+                NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.CreationTime,
+            };
+            watcher.Changed += OnRequestFileTouched;
+            watcher.Created += OnRequestFileTouched;
+            watcher.EnableRaisingEvents = true;
+            s_requestWatcher = watcher;
+        }
+
+        /// <summary>Runs on FileSystemWatcher's own background thread --
+        /// Camera/Transform access (in RunQueuedExport) throws if called
+        /// from here directly, so this only ever queues the real work onto
+        /// the main thread via EditorApplication.delayCall, the same
+        /// marshal-to-main-thread pattern AvaSnap's OWN FileSystemWatcher
+        /// uses in the opposite direction (Dispatcher.BeginInvoke).</summary>
+        private static void OnRequestFileTouched(object sender, FileSystemEventArgs e)
+        {
+            if (s_exportQueued) return;
+            s_exportQueued = true;
+            EditorApplication.delayCall += RunQueuedExport;
+        }
+
+        private static void RunQueuedExport()
+        {
+            s_exportQueued = false;
+            if (!s_enabled) return;
+            var target = s_targetCameraOverride != null ? s_targetCameraOverride : Camera.main;
+            s_lastRequestStatus = target != null
+                ? $"最終応答: {DateTime.Now:HH:mm:ss} ({target.name})"
+                : $"最終応答: {DateTime.Now:HH:mm:ss} (対象カメラが見つかりませんでした)";
+            if (target == null) return;
+            ExportCamera(target);
+        }
+
         private void OnGUI()
         {
             EditorGUI.BeginChangeCheck();
-            bool enabled = EditorGUILayout.Toggle("AvaSnapへ送信", Enabled);
+            bool enabled = EditorGUILayout.Toggle("AvaSnapからの取得に応答", Enabled);
             if (EditorGUI.EndChangeCheck()) Enabled = enabled;
 
             s_targetCameraOverride = (Camera)EditorGUILayout.ObjectField(
                 "対象カメラ (未指定ならCamera.main)", s_targetCameraOverride, typeof(Camera), true);
 
+            // Manual test button: exercises the exact same ExportCamera path
+            // a real AvaSnap request would, without needing AvaSnap running
+            // to verify this side works.
+            using (new EditorGUI.DisabledScope(!Enabled))
+            {
+                if (GUILayout.Button("今すぐ送信 (テスト用)"))
+                {
+                    var target = s_targetCameraOverride != null ? s_targetCameraOverride : Camera.main;
+                    if (target != null) ExportCamera(target);
+                }
+            }
+
             EditorGUILayout.HelpBox(
-                "プレイモード・エディタモードを問わず、対象カメラの実際のFOV・傾き(ピッチ/ロール)を" +
-                $"最大約{1.0 / ExportIntervalSeconds:F0}Hzでファイルに書き出します。AvaSnapの位置合わせ" +
-                "モードがこれを読み取り、遠近ガイド線として表示します(要AvaSnap側の対応)。値が" +
-                "変化していない間は書き出しを行いません(ディスク書き込みを抑えるため)。\n\n" +
-                "このUnityウィンドウがアクティブな間だけ書き出します(AvaSnap/VRChatなど他の" +
-                "ウィンドウを見ている間は書き出しが止まり、ガイドはその時点の値のまま止まります)。\n\n" +
+                "AvaSnapの位置合わせモードで「取得」ボタンが押されるたびに、対象カメラの実際の" +
+                "FOV・傾き(ピッチ/ロール)を一度だけファイルに書き出します(Unityのカメラを動かしても" +
+                "自動では追従しません。押されるたびのスナップショット取得です)。\n\n" +
+                "リクエストが来るまでUnity側は何も処理しません(常時監視のポーリングではなく、" +
+                "OSのファイル変更通知を待つだけ)。\n\n" +
+                s_lastRequestStatus + "\n\n" +
                 "出力先: " + ExportPath,
                 MessageType.Info);
-        }
-
-        /// <summary>Simple focus gate: only export while THIS Unity Editor
-        /// instance is the OS-focused window. Note the known tradeoff --
-        /// the guide freezes (or, if it never got a first export, stays
-        /// blank) the moment you switch to VRChat/AvaSnap to actually look
-        /// at it, since that's exactly when this instance loses focus.
-        /// Deliberately kept anyway per explicit request for the simple
-        /// version over the more correct-but-heavier "only defer to a
-        /// DIFFERENT focused Unity instance" check (P/Invoke + process
-        /// lookups) from an earlier revision.</summary>
-        private static void OnEditorUpdate()
-        {
-            if (!s_enabled) return;
-            if (!UnityEditorInternal.InternalEditorUtility.isApplicationActive) return;
-            double now = EditorApplication.timeSinceStartup;
-            if (now - s_lastExportTime < ExportIntervalSeconds) return;
-            s_lastExportTime = now;
-
-            var target = s_targetCameraOverride != null ? s_targetCameraOverride : Camera.main;
-            if (target == null) return;
-            ExportCamera(target);
         }
 
         /// <summary>Pitch/roll are derived from the camera's forward/up
@@ -149,20 +192,10 @@ namespace Qsyi.CameraGuide.Editor
             double roll = levelUp.sqrMagnitude > 1e-6f
                 ? Vector3.SignedAngle(levelUp.normalized, cam.transform.up, forward)
                 : 0.0;
-            double fov = cam.fieldOfView;
-
-            // Dirty-check: skip the actual disk write when nothing's moved
-            // -- see the consts' own doc comment for why no periodic
-            // keep-alive write is needed on top of this.
-            bool changed = !s_hasLastWritten
-                || Math.Abs(fov - s_lastWrittenFov) > ExportChangeThreshold
-                || Math.Abs(pitch - s_lastWrittenPitch) > ExportChangeThreshold
-                || Math.Abs(roll - s_lastWrittenRoll) > ExportChangeThreshold;
-            if (!changed) return;
 
             var export = new CameraGuideExport
             {
-                fov = fov,
+                fov = cam.fieldOfView,
                 pitch = pitch,
                 roll = roll,
                 timestampUtc = DateTime.UtcNow.ToString("o"),
@@ -170,25 +203,14 @@ namespace Qsyi.CameraGuide.Editor
 
             try
             {
-                string dir = Path.GetDirectoryName(ExportPath);
-                if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir)) Directory.CreateDirectory(dir);
+                Directory.CreateDirectory(AppDataDir);
                 File.WriteAllText(ExportPath, JsonUtility.ToJson(export, true));
-                // Only recorded on a SUCCESSFUL write: if this failed below,
-                // leaving these untouched means `changed` stays true (still
-                // compared against the last WRITTEN values, not this
-                // attempt's), so the very next tick retries instead of
-                // silently going quiet until the camera happens to move
-                // again.
-                s_hasLastWritten = true;
-                s_lastWrittenFov = fov;
-                s_lastWrittenPitch = pitch;
-                s_lastWrittenRoll = roll;
             }
             catch (IOException)
             {
                 // AvaSnap might have the file open for reading at the exact
-                // wrong instant -- harmless, just skip this tick and retry
-                // on the next one.
+                // wrong instant -- harmless, this request just goes
+                // unanswered (the user can press 取得 again).
             }
         }
     }
