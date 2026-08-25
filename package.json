@@ -1,6 +1,6 @@
 {
   "name": "jp.qsyi.avasnap",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "displayName": "AvaSnap連携",
   "description": "デスクトップアプリAvaSnapとの連携ツール。位置合わせモードの「取得」ボタンが押されるたびに、Camera.mainのFOV/ピッチ/ロールを一度だけファイル出力します。設定不要、バックグラウンドで自動的に動作します。",
   "unity": "2022.3",
