@@ -39,14 +39,32 @@ namespace Qsyi.CameraGuide.Editor
         private const string EnabledPrefKey = "Qsyi.CameraCompositionGuide.Enabled";
 
         // 5-10Hz is plenty smooth for a composition guide and keeps the
-        // disk writes trivial -- no need to match render framerate for
+        // per-tick check trivial -- no need to match render framerate for
         // numbers that only change as fast as someone can move a mouse/
-        // keyboard-driven camera.
+        // keyboard-driven camera. This is just how often we RE-CHECK
+        // whether anything changed, not how often we actually write to
+        // disk -- see ExportCamera's own dirty-check.
         private const double ExportIntervalSeconds = 0.15;
+
+        // While the camera is holding still (the common case while tweaking
+        // everything ELSE about a shot), there's nothing new to write --
+        // ExportCamera skips the actual File.WriteAllText when fov/pitch/
+        // roll haven't moved, cutting idle-time disk I/O by ~85% instead of
+        // writing the same numbers ~6.7 times a second forever. Still writes
+        // at least this often regardless (a "heartbeat"), well under
+        // AvaSnap's own UnityCameraGuideService.StaleAfter (2s) with margin,
+        // so the guide never gets hidden as "stale" just because the camera
+        // stopped moving.
+        private const double HeartbeatIntervalSeconds = 1.0;
+
+        private const double ExportChangeThreshold = 0.01;
 
         private static bool s_enabled;
         private static Camera s_targetCameraOverride;
         private static double s_lastExportTime;
+        private static double s_lastWriteTime = double.NegativeInfinity;
+        private static bool s_hasLastWritten;
+        private static double s_lastWrittenFov, s_lastWrittenPitch, s_lastWrittenRoll;
         private static readonly string ExportPath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "AvaSnap", "unity_camera_guide.json");
 
@@ -86,8 +104,11 @@ namespace Qsyi.CameraGuide.Editor
 
             EditorGUILayout.HelpBox(
                 "プレイモード・エディタモードを問わず、対象カメラの実際のFOV・傾き(ピッチ/ロール)を" +
-                $"約{1.0 / ExportIntervalSeconds:F0}Hzでファイルに書き出します。AvaSnapの位置合わせ" +
-                "モードがこれを読み取り、遠近ガイド線として表示します(要AvaSnap側の対応)。\n\n" +
+                "ファイルに書き出します。AvaSnapの位置合わせモードがこれを読み取り、遠近ガイド線と" +
+                "して表示します(要AvaSnap側の対応)。カメラが動いている間だけ" +
+                $"約{1.0 / ExportIntervalSeconds:F0}Hzで書き出し、静止中は約{1.0 / HeartbeatIntervalSeconds:F0}Hz" +
+                "まで間隔を空けます(ディスク書き込みを抑えるため。値が変わらない限りAvaSnap側の" +
+                "表示は途切れません)。\n\n" +
                 "このUnityウィンドウがアクティブな間だけ書き出します(AvaSnap/VRChatなど他の" +
                 "ウィンドウを見ている間は書き出しが止まり、ガイドはその時点の値のまま止まります)。\n\n" +
                 "出力先: " + ExportPath,
@@ -132,10 +153,22 @@ namespace Qsyi.CameraGuide.Editor
             double roll = levelUp.sqrMagnitude > 1e-6f
                 ? Vector3.SignedAngle(levelUp.normalized, cam.transform.up, forward)
                 : 0.0;
+            double fov = cam.fieldOfView;
+
+            // Dirty-check + heartbeat: skip the actual disk write when
+            // nothing's moved AND the heartbeat interval hasn't elapsed yet
+            // -- see the consts' own doc comment for why the heartbeat
+            // still has to fire periodically regardless.
+            double now = EditorApplication.timeSinceStartup;
+            bool changed = !s_hasLastWritten
+                || Math.Abs(fov - s_lastWrittenFov) > ExportChangeThreshold
+                || Math.Abs(pitch - s_lastWrittenPitch) > ExportChangeThreshold
+                || Math.Abs(roll - s_lastWrittenRoll) > ExportChangeThreshold;
+            if (!changed && now - s_lastWriteTime < HeartbeatIntervalSeconds) return;
 
             var export = new CameraGuideExport
             {
-                fov = cam.fieldOfView,
+                fov = fov,
                 pitch = pitch,
                 roll = roll,
                 timestampUtc = DateTime.UtcNow.ToString("o"),
@@ -146,6 +179,16 @@ namespace Qsyi.CameraGuide.Editor
                 string dir = Path.GetDirectoryName(ExportPath);
                 if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir)) Directory.CreateDirectory(dir);
                 File.WriteAllText(ExportPath, JsonUtility.ToJson(export, true));
+                // Only recorded on a SUCCESSFUL write: if this failed below,
+                // leaving these untouched means the heartbeat's `now -
+                // s_lastWriteTime` keeps growing, so the very next tick(s)
+                // just keep retrying instead of silently going quiet until
+                // the camera happens to move again.
+                s_hasLastWritten = true;
+                s_lastWriteTime = now;
+                s_lastWrittenFov = fov;
+                s_lastWrittenPitch = pitch;
+                s_lastWrittenRoll = roll;
             }
             catch (IOException)
             {
