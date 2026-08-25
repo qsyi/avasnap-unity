@@ -34,15 +34,23 @@ namespace Qsyi.CameraGuide.Editor
     /// Camera on a timer (EditorApplication.update) the whole time this was
     /// enabled, which meant Unity was doing SOME work (a per-tick check, or
     /// worse, a disk write) even while nobody was looking at the guide at
-    /// all. This version does none of that -- it sits on a FileSystemWatcher
-    /// waiting for AvaSnap's own "取得" button to touch RequestPath, and
-    /// only then reads the camera and writes ExportPath, once. Genuinely
-    /// zero background cost between requests (a FileSystemWatcher is an OS-
-    /// level notification, not a poll), at the cost of losing the old
-    /// "guide live-follows the camera as you drag it in Unity" behavior --
-    /// AvaSnap now shows a snapshot from the last time its own button was
-    /// pressed, not a continuous feed. Deliberate tradeoff, chosen over the
-    /// old polling version for exactly that reason.
+    /// all. This version does none of that per-tick CAMERA work -- it only
+    /// reads the camera and writes ExportPath in response to AvaSnap's own
+    /// "取得" button touching RequestPath, never continuously. That
+    /// response is driven by a FileSystemWatcher (near-instant when it
+    /// works) PLUS a cheap poll-fallback (see RequestPollIntervalSeconds/
+    /// OnEditorUpdate) that only stats RequestPath's own last-write time,
+    /// never touching the camera unless a real request is actually pending
+    /// -- the same dual-mechanism AvaSnap's OWN file watching already uses,
+    /// because FileSystemWatcher has demonstrated, environment-dependent
+    /// unreliability on this exact AppData folder (confirmed: Unity's
+    /// watcher-only first version never reacted to AvaSnap's requests at
+    /// all here, even though AvaSnap's own watcher+poll combo on the
+    /// RESPONSE file worked fine). Still loses the old "guide live-follows
+    /// the camera as you drag it in Unity" behavior -- AvaSnap shows a
+    /// snapshot from the last time its own button was pressed, not a
+    /// continuous feed. Deliberate tradeoff, chosen over the old polling
+    /// version for that reason.
     ///
     /// Works in both Edit mode and Play mode. Lives entirely under an
     /// "Editor" folder, so it never ships with the uploaded world, and only
@@ -70,6 +78,14 @@ namespace Qsyi.CameraGuide.Editor
         // land into a single EditorApplication.delayCall queued for the
         // next main-thread tick, instead of queuing one per event.
         private static volatile bool s_exportQueued;
+
+        // Poll-fallback for when the watcher above just doesn't fire (see
+        // this class's own doc comment) -- cheap on purpose: only stats
+        // RequestPath's own last-write time, never reads/parses anything
+        // and never touches the camera unless that time actually changed.
+        private const double RequestPollIntervalSeconds = 0.5;
+        private static double s_lastRequestPollTime;
+        private static DateTime s_lastSeenRequestWriteTimeUtc;
 
         private static string s_lastRequestStatus = "リクエスト待機中(AvaSnapの「取得」ボタンを押すと反応します)";
 
@@ -99,13 +115,15 @@ namespace Qsyi.CameraGuide.Editor
         [MenuItem("Tools/qsyi/カメラ構図補助線 (AvaSnap連携)")]
         private static void Open() => GetWindow<CameraCompositionGuideWindow>("構図補助線");
 
-        /// <summary>(Re)creates the watcher to match the current Enabled
-        /// state -- called from the Enabled setter and the static
+        /// <summary>(Re)creates the watcher (and the poll-fallback's own
+        /// EditorApplication.update subscription) to match the current
+        /// Enabled state -- called from the Enabled setter and the static
         /// constructor, the only two places that state can change.</summary>
         private static void UpdateWatcher()
         {
             s_requestWatcher?.Dispose();
             s_requestWatcher = null;
+            EditorApplication.update -= OnEditorUpdate;
             if (!s_enabled) return;
 
             Directory.CreateDirectory(AppDataDir);
@@ -117,6 +135,15 @@ namespace Qsyi.CameraGuide.Editor
             watcher.Created += OnRequestFileTouched;
             watcher.EnableRaisingEvents = true;
             s_requestWatcher = watcher;
+
+            // Seeded from whatever's already on disk (e.g. a leftover
+            // request from a previous session) so the poll below doesn't
+            // treat it as a brand-new request the moment polling starts --
+            // same reasoning as AvaSnap's own UnityCameraGuideService.Start
+            // seeding its side against the exact same kind of stale-file
+            // false-positive.
+            s_lastSeenRequestWriteTimeUtc = File.Exists(RequestPath) ? File.GetLastWriteTimeUtc(RequestPath) : DateTime.MinValue;
+            EditorApplication.update += OnEditorUpdate;
         }
 
         /// <summary>Runs on FileSystemWatcher's own background thread --
@@ -125,7 +152,27 @@ namespace Qsyi.CameraGuide.Editor
         /// the main thread via EditorApplication.delayCall, the same
         /// marshal-to-main-thread pattern AvaSnap's OWN FileSystemWatcher
         /// uses in the opposite direction (Dispatcher.BeginInvoke).</summary>
-        private static void OnRequestFileTouched(object sender, FileSystemEventArgs e)
+        private static void OnRequestFileTouched(object sender, FileSystemEventArgs e) => QueueExport();
+
+        /// <summary>The poll-fallback tick -- already on the main thread
+        /// (EditorApplication.update), so no delayCall marshaling is
+        /// strictly needed here, but routing through the same QueueExport
+        /// keeps the watcher and poll paths from ever double-queuing if
+        /// both happen to notice the same request.</summary>
+        private static void OnEditorUpdate()
+        {
+            double now = EditorApplication.timeSinceStartup;
+            if (now - s_lastRequestPollTime < RequestPollIntervalSeconds) return;
+            s_lastRequestPollTime = now;
+
+            if (!File.Exists(RequestPath)) return;
+            var writeTimeUtc = File.GetLastWriteTimeUtc(RequestPath);
+            if (writeTimeUtc == s_lastSeenRequestWriteTimeUtc) return;
+            s_lastSeenRequestWriteTimeUtc = writeTimeUtc;
+            QueueExport();
+        }
+
+        private static void QueueExport()
         {
             if (s_exportQueued) return;
             s_exportQueued = true;
@@ -169,8 +216,9 @@ namespace Qsyi.CameraGuide.Editor
                 "AvaSnapの位置合わせモードで「取得」ボタンが押されるたびに、対象カメラの実際の" +
                 "FOV・傾き(ピッチ/ロール)を一度だけファイルに書き出します(Unityのカメラを動かしても" +
                 "自動では追従しません。押されるたびのスナップショット取得です)。\n\n" +
-                "リクエストが来るまでUnity側は何も処理しません(常時監視のポーリングではなく、" +
-                "OSのファイル変更通知を待つだけ)。\n\n" +
+                "リクエストが来るまでカメラの処理は行いません(OSのファイル変更通知が主、" +
+                $"念のため{RequestPollIntervalSeconds:0.#}秒おきにリクエストファイルの更新日時だけ" +
+                "軽く確認するフォールバック付き)。\n\n" +
                 s_lastRequestStatus + "\n\n" +
                 "出力先: " + ExportPath,
                 MessageType.Info);
