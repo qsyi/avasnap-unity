@@ -1,0 +1,12 @@
+{
+  "name": "jp.qsyi.avasnap",
+  "version": "0.1.0",
+  "displayName": "AvaSnap連携",
+  "description": "デスクトップアプリAvaSnapとの連携ツール。位置合わせモード用に、UnityエディタのカメラFOV/ピッチ/ロールをリアルタイムでファイル出力します。",
+  "unity": "2022.3",
+  "author": {
+    "name": "qsyi",
+    "url": "https://github.com/qsyi"
+  },
+  "license": "MIT-0"
+}
