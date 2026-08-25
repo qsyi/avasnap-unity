@@ -11,9 +11,8 @@ namespace Qsyi.CameraGuide.Editor
     /// below the horizontal, degrees, positive = looking up), and roll
     /// (camera tilt around its own forward axis, degrees). World POSITION
     /// is deliberately not included -- AvaSnap has no 3D scene to place it
-    /// in, so the guide it draws is (like Unity's own version was) centered
-    /// wherever the camera currently is, not tied to a specific world
-    /// point.</summary>
+    /// in, so the guide it draws is centered wherever the camera currently
+    /// is, not tied to a specific world point.</summary>
     [Serializable]
     public class CameraGuideExport
     {
@@ -23,52 +22,52 @@ namespace Qsyi.CameraGuide.Editor
         public string timestampUtc;
     }
 
-    /// <summary>Editor-only: exports the target Camera's real FOV/pitch/
-    /// roll to a JSON file AvaSnap reads, so AvaSnap's own 位置合わせモード
-    /// guide overlay (drawn over the live VRChat window, see AvaSnap's
-    /// ControlPanelWindow) can match whatever camera angle is currently
-    /// being tested in Unity instead of requiring manual FOV input/horizon
-    /// dragging.
+    /// <summary>Editor-only, headless (no window, no Tools menu entry --
+    /// nothing to configure): exports Camera.main's real FOV/pitch/roll to
+    /// a JSON file AvaSnap reads, so AvaSnap's own 位置合わせモード guide
+    /// overlay (drawn over the live VRChat window) can match whatever
+    /// camera angle is currently being tested in Unity instead of requiring
+    /// manual FOV input/horizon dragging.
     ///
-    /// REQUEST-DRIVEN, not continuous: earlier revisions polled the target
-    /// Camera on a timer (EditorApplication.update) the whole time this was
-    /// enabled, which meant Unity was doing SOME work (a per-tick check, or
-    /// worse, a disk write) even while nobody was looking at the guide at
-    /// all. This version does none of that per-tick CAMERA work -- it only
-    /// reads the camera and writes ExportPath in response to AvaSnap's own
-    /// "取得" button touching RequestPath, never continuously. That
+    /// REQUEST-DRIVEN: only reads the camera and writes ExportPath when
+    /// AvaSnap's own 取得 button touches RequestPath -- never continuously,
+    /// so there's no per-frame camera work while nobody's asking. That
     /// response is driven by a FileSystemWatcher (near-instant when it
-    /// works) PLUS a cheap poll-fallback (see RequestPollIntervalSeconds/
-    /// OnEditorUpdate) that only stats RequestPath's own last-write time,
-    /// never touching the camera unless a real request is actually pending
-    /// -- the same dual-mechanism AvaSnap's OWN file watching already uses,
-    /// because FileSystemWatcher has demonstrated, environment-dependent
-    /// unreliability on this exact AppData folder (confirmed: Unity's
-    /// watcher-only first version never reacted to AvaSnap's requests at
-    /// all here, even though AvaSnap's own watcher+poll combo on the
-    /// RESPONSE file worked fine). Still loses the old "guide live-follows
-    /// the camera as you drag it in Unity" behavior -- AvaSnap shows a
-    /// snapshot from the last time its own button was pressed, not a
-    /// continuous feed. Deliberate tradeoff, chosen over the old polling
-    /// version for that reason.
+    /// fires) PLUS a cheap poll-fallback (RequestPollIntervalSeconds/
+    /// OnEditorUpdate) that only stats RequestPath's own last-write time --
+    /// never touching the camera unless a request is actually pending.
+    /// Needed in practice, not just in theory: FileSystemWatcher alone
+    /// never reacted to AvaSnap's requests on this exact AppData folder
+    /// (confirmed by testing), matching AvaSnap's own already-documented
+    /// experience with the same folder on its READ side, which is why it
+    /// already carries the identical watcher+poll combo. Neither OneDrive
+    /// redirection nor an obviously misconfigured watcher explains it here;
+    /// Windows Defender real-time protection intercepting the small, quick
+    /// writes is the most likely remaining culprit, but isn't something a
+    /// portable package can safely work around (an AV exclusion is a
+    /// per-machine setting, not something this script can or should touch).
+    /// A named-pipe/loopback-socket based bridge would sidestep
+    /// FileSystemWatcher's OS-notification reliability entirely and could
+    /// drop the poll, but is meaningfully more code (connection lifecycle,
+    /// cross-domain-reload handling) for what this is: a personal dev tool,
+    /// not something facing untrusted users or scale. The 0.5s metadata-only
+    /// stat this poll does instead is cheap enough that the tradeoff isn't
+    /// worth it unless the watcher's unreliability turns out to be worse
+    /// than observed so far.
     ///
     /// Works in both Edit mode and Play mode. Lives entirely under an
     /// "Editor" folder, so it never ships with the uploaded world, and only
     /// ever touches files in AvaSnap's own AppData folder -- no network, no
     /// scene hierarchy changes.</summary>
     [InitializeOnLoad]
-    public class CameraCompositionGuideWindow : EditorWindow
+    internal static class CameraCompositionGuideExporter
     {
-        private const string EnabledPrefKey = "Qsyi.CameraCompositionGuide.Enabled";
-
         private static readonly string AppDataDir = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "AvaSnap");
         private static readonly string ExportPath = Path.Combine(AppDataDir, "unity_camera_guide.json");
         private const string RequestFileName = "unity_camera_guide_request.txt";
         private static readonly string RequestPath = Path.Combine(AppDataDir, RequestFileName);
 
-        private static bool s_enabled;
-        private static Camera s_targetCameraOverride;
         private static FileSystemWatcher s_requestWatcher;
 
         // FileSystemWatcher's Changed event can fire more than once for a
@@ -87,46 +86,10 @@ namespace Qsyi.CameraGuide.Editor
         private static double s_lastRequestPollTime;
         private static DateTime s_lastSeenRequestWriteTimeUtc;
 
-        private static string s_lastRequestStatus = "リクエスト待機中(AvaSnapの「取得」ボタンを押すと反応します)";
-
-        /// <summary>EditorPrefs (not SessionState): persists across Editor
-        /// restarts, defaults to true, global per-machine. Now also gates
-        /// whether the FileSystemWatcher exists at all -- turning this off
-        /// means Unity doesn't even listen for requests, not just "listens
-        /// but ignores them".</summary>
-        private static bool Enabled
+        static CameraCompositionGuideExporter()
         {
-            get => s_enabled;
-            set
-            {
-                if (s_enabled == value) return;
-                s_enabled = value;
-                EditorPrefs.SetBool(EnabledPrefKey, value);
-                UpdateWatcher();
-            }
-        }
-
-        static CameraCompositionGuideWindow()
-        {
-            s_enabled = EditorPrefs.GetBool(EnabledPrefKey, true);
-            UpdateWatcher();
-        }
-
-        [MenuItem("Tools/qsyi/カメラ構図補助線 (AvaSnap連携)")]
-        private static void Open() => GetWindow<CameraCompositionGuideWindow>("構図補助線");
-
-        /// <summary>(Re)creates the watcher (and the poll-fallback's own
-        /// EditorApplication.update subscription) to match the current
-        /// Enabled state -- called from the Enabled setter and the static
-        /// constructor, the only two places that state can change.</summary>
-        private static void UpdateWatcher()
-        {
-            s_requestWatcher?.Dispose();
-            s_requestWatcher = null;
-            EditorApplication.update -= OnEditorUpdate;
-            if (!s_enabled) return;
-
             Directory.CreateDirectory(AppDataDir);
+
             var watcher = new FileSystemWatcher(AppDataDir, RequestFileName)
             {
                 NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.CreationTime,
@@ -182,46 +145,13 @@ namespace Qsyi.CameraGuide.Editor
         private static void RunQueuedExport()
         {
             s_exportQueued = false;
-            if (!s_enabled) return;
-            var target = s_targetCameraOverride != null ? s_targetCameraOverride : Camera.main;
-            s_lastRequestStatus = target != null
-                ? $"最終応答: {DateTime.Now:HH:mm:ss} ({target.name})"
-                : $"最終応答: {DateTime.Now:HH:mm:ss} (対象カメラが見つかりませんでした)";
-            if (target == null) return;
-            ExportCamera(target);
-        }
-
-        private void OnGUI()
-        {
-            EditorGUI.BeginChangeCheck();
-            bool enabled = EditorGUILayout.Toggle("AvaSnapからの取得に応答", Enabled);
-            if (EditorGUI.EndChangeCheck()) Enabled = enabled;
-
-            s_targetCameraOverride = (Camera)EditorGUILayout.ObjectField(
-                "対象カメラ (未指定ならCamera.main)", s_targetCameraOverride, typeof(Camera), true);
-
-            // Manual test button: exercises the exact same ExportCamera path
-            // a real AvaSnap request would, without needing AvaSnap running
-            // to verify this side works.
-            using (new EditorGUI.DisabledScope(!Enabled))
+            var target = Camera.main;
+            if (target == null)
             {
-                if (GUILayout.Button("今すぐ送信 (テスト用)"))
-                {
-                    var target = s_targetCameraOverride != null ? s_targetCameraOverride : Camera.main;
-                    if (target != null) ExportCamera(target);
-                }
+                Debug.LogWarning("[AvaSnap連携] Camera.mainが見つからないため、カメラ構図補助線を送信できませんでした。");
+                return;
             }
-
-            EditorGUILayout.HelpBox(
-                "AvaSnapの位置合わせモードで「取得」ボタンが押されるたびに、対象カメラの実際の" +
-                "FOV・傾き(ピッチ/ロール)を一度だけファイルに書き出します(Unityのカメラを動かしても" +
-                "自動では追従しません。押されるたびのスナップショット取得です)。\n\n" +
-                "リクエストが来るまでカメラの処理は行いません(OSのファイル変更通知が主、" +
-                $"念のため{RequestPollIntervalSeconds:0.#}秒おきにリクエストファイルの更新日時だけ" +
-                "軽く確認するフォールバック付き)。\n\n" +
-                s_lastRequestStatus + "\n\n" +
-                "出力先: " + ExportPath,
-                MessageType.Info);
+            ExportCamera(target);
         }
 
         /// <summary>Pitch/roll are derived from the camera's forward/up
